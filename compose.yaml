@@ -1,0 +1,26 @@
+# Tonton: daftar tontonan anime keluarga (port 8093, LAN + Tailscale).
+# Katalog dibaca read-only dari ~/server/watchlist (cron Python tetap memperbaruinya).
+# Data akun & daftar: /data/appdata/tonton (cadangan harian 14 hari di backup/).
+#
+#   docker compose up -d --build
+#   docker exec -i tonton /tonton user add <nama> [--admin]   # PIN dibaca dari stdin
+#   docker exec tonton /tonton user list
+services:
+  tonton:
+    build: .
+    image: tonton:latest
+    container_name: tonton
+    restart: unless-stopped
+    ports:
+      - "8093:8080"          # server menolak alamat di luar LAN/Tailscale (lihat internal/api)
+    environment:
+      TONTON_CATALOG: /watchlist/seasons-web/data
+      TONTON_SYNOPSIS: /watchlist/id-synopsis.json
+    volumes:
+      - /home/orbitary/server/watchlist:/watchlist:ro
+      - /data/appdata/tonton:/data
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 256m
+    pids_limit: 64
