@@ -4,6 +4,7 @@
 //	tonton user add <name> [--admin]   add a member (PIN read from stdin or TONTON_PIN)
 //	tonton user pin <name>             set a new PIN
 //	tonton user rename <name> <new>
+//	tonton user remove <name>         delete a member (their list is backed up first)
 //	tonton user list
 //	tonton import <name> <state.json>  copy a list from the old Arsip sync file
 package main
@@ -19,6 +20,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -86,6 +88,7 @@ func serve() error {
 	}
 	srv := &api.Server{
 		Cat: cat, Store: st, Loc: loc, Static: web.Files(),
+		DataDir: env("TONTON_DATA", "/data"), Token: os.Getenv("TONTON_SUMMARY_TOKEN"),
 		Sessions: auth.Sessions{Key: key, TTL: 180 * 24 * time.Hour, Now: time.Now},
 		Limiter:  &auth.Limiter{Free: 5, Max: 15 * time.Minute, Now: time.Now},
 		AnyIP:    os.Getenv("TONTON_ALLOW_ANY_IP") == "1",
@@ -150,7 +153,7 @@ func readPIN() (string, error) {
 
 func userCmd(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: tonton user add|pin|rename|list")
+		return errors.New("usage: tonton user add|pin|rename|remove|list")
 	}
 	st, err := openStore()
 	if err != nil {
@@ -188,6 +191,20 @@ func userCmd(args []string) error {
 			return err
 		}
 		fmt.Printf("added %s (%s)\n", u.Name, u.ID)
+		return nil
+	case "remove":
+		if len(args) != 2 {
+			return errors.New("usage: tonton user remove <name>")
+		}
+		u, ok := st.UserByName(args[1])
+		if !ok {
+			return fmt.Errorf("no member named %q", args[1])
+		}
+		if err := st.DeleteUser(u.ID); err != nil {
+			return err
+		}
+		_ = os.Remove(filepath.Join(env("TONTON_DATA", "/data"), "temuan", u.ID+".json"))
+		fmt.Printf("removed %s\n", u.Name)
 		return nil
 	case "rename":
 		if len(args) != 3 {
@@ -253,14 +270,16 @@ func importCmd(args []string) error {
 	}
 	var old struct {
 		My map[string]struct {
-			At  int64  `json:"at"`
-			Del int    `json:"del"`
-			S   string `json:"s"`
-			Ep  int    `json:"ep"`
-			R   int    `json:"r"`
-			N   string `json:"n"`
-			Sa  int64  `json:"sa"`
-			Fa  int64  `json:"fa"`
+			At  int64           `json:"at"`
+			Del int             `json:"del"`
+			S   string          `json:"s"`
+			Ep  int             `json:"ep"`
+			R   int             `json:"r"`
+			N   string          `json:"n"`
+			Sa  int64           `json:"sa"`
+			Fa  int64           `json:"fa"`
+			Pr  int             `json:"pr"`
+			D   json.RawMessage `json:"d"`
 		} `json:"my"`
 	}
 	if err := json.Unmarshal(b, &old); err != nil {
@@ -289,6 +308,20 @@ func importCmd(args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("imported %d of %d entries into %s\n", n, len(entries), u.Name)
+	var prio []int
+	for k, v := range old.My {
+		if id, err := strconv.Atoi(k); err == nil && v.Pr != 0 && v.Del == 0 {
+			prio = append(prio, id)
+		}
+	}
+	taste := map[string]int{}
+	if sel, ok := old.My["_sel"]; ok && len(sel.D) > 0 {
+		_ = json.Unmarshal(sel.D, &taste)
+	}
+	np, err := st.ApplyLegacy(u.ID, prio, taste)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("imported %d of %d entries into %s; %d priorities, %d taste settings\n", n, len(entries), u.Name, np, len(taste))
 	return nil
 }

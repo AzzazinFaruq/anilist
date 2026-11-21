@@ -1,7 +1,7 @@
 import { useSyncExternalStore } from "react";
 
 // Pages are paths; the open title is ?judul=<id> so Back closes it.
-export type Page = "nonton" | "daftar" | "cari" | "akun";
+export type Page = "nonton" | "jelajah" | "temuan" | "daftar" | "akun";
 
 const listeners = new Set<() => void>();
 const notify = () => listeners.forEach((l) => l());
@@ -18,7 +18,7 @@ export function useLocation() {
   const loc = useSyncExternalStore(subscribe, snapshot);
   const url = new URL(loc, location.origin);
   const seg = url.pathname.split("/")[1];
-  const page: Page = seg === "daftar" || seg === "cari" || seg === "akun" ? seg : "nonton";
+  const page: Page = seg === "jelajah" || seg === "temuan" || seg === "daftar" || seg === "akun" ? seg : seg === "cari" ? "jelajah" : "nonton";
   const open = Number(url.searchParams.get("judul")) || null;
   return { page, open, params: url.searchParams };
 }
@@ -54,11 +54,15 @@ export function closeTitle() {
   }
 }
 
-/** Keep other query params (e.g. ?q= on Cari) without adding history entries. */
-export function setParam(key: string, value: string | null) {
+/** Change query params in place (no new history entry). null removes a key. */
+export function setParams(changes: Record<string, string | null>) {
   const url = new URL(location.href);
-  if (value) url.searchParams.set(key, value);
-  else url.searchParams.delete(key);
+  for (const [k, v] of Object.entries(changes)) {
+    if (v) url.searchParams.set(k, v);
+    else url.searchParams.delete(k);
+  }
   history.replaceState(history.state, "", url.pathname + url.search);
   notify();
 }
+
+export const setParam = (key: string, value: string | null) => setParams({ [key]: value });

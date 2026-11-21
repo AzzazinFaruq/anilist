@@ -13,6 +13,7 @@ services:
     restart: unless-stopped
     ports:
       - "8093:8080"          # server menolak alamat di luar LAN/Tailscale (lihat internal/api)
+    env_file: .env           # TONTON_SUMMARY_TOKEN (dibaca dashboard), chmod 600, tidak masuk git
     environment:
       TONTON_CATALOG: /watchlist/seasons-web/data
       TONTON_SYNOPSIS: /watchlist/id-synopsis.json

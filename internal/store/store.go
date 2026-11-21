@@ -67,7 +67,8 @@ type Entry struct {
 	Episode  int    `json:"episode,omitempty"`
 	Rating   int    `json:"rating,omitempty"` // 1–10, 0 = not rated
 	Note     string `json:"note,omitempty"`
-	Updated  int64  `json:"updated"` // unix ms
+	Priority bool   `json:"priority,omitempty"` // watch this before the rest of the plan
+	Updated  int64  `json:"updated"`            // unix ms
 	Started  int64  `json:"started,omitempty"`
 	Finished int64  `json:"finished,omitempty"`
 }
@@ -75,7 +76,16 @@ type Entry struct {
 // List is everything stored for one member.
 type List struct {
 	Entries map[int]Entry  `json:"entries"`
-	Log     map[string]int `json:"log"` // "2026-11-21" → episodes watched that day
+	Log     map[string]int `json:"log"`               // "2026-11-21" → episodes watched that day
+	Hidden  map[int]int64  `json:"hidden,omitempty"`  // "not interested" (from recommendations) → unix ms
+	Taste   map[string]int `json:"taste,omitempty"`   // "g:Action" / "t:Isekai" / "x:pure-romance" → 3 like, 2 okay, 1 avoid
+	Presets []Preset       `json:"presets,omitempty"` // saved browse filters
+}
+
+// Preset is a saved Jelajah filter: a name and the page's query string.
+type Preset struct {
+	Name  string `json:"name"`
+	Query string `json:"query"`
 }
 
 // Store is safe for concurrent use.
@@ -331,6 +341,27 @@ func (s *Store) saveUsers() error {
 
 // ---------- lists ----------
 
+func newList() *List {
+	l := &List{}
+	fill(l)
+	return l
+}
+
+func fill(l *List) {
+	if l.Entries == nil {
+		l.Entries = map[int]Entry{}
+	}
+	if l.Log == nil {
+		l.Log = map[string]int{}
+	}
+	if l.Hidden == nil {
+		l.Hidden = map[int]int64{}
+	}
+	if l.Taste == nil {
+		l.Taste = map[string]int{}
+	}
+}
+
 func (s *Store) listPath(uid string) string { return filepath.Join(s.dir, "lists", uid+".json") }
 
 func (s *Store) listLocked(uid string) (*List, error) {
@@ -338,7 +369,7 @@ func (s *Store) listLocked(uid string) (*List, error) {
 	if l, ok := s.lists[uid]; ok && mod.Equal(s.listMod[uid]) {
 		return l, nil
 	}
-	l := &List{Entries: map[int]Entry{}, Log: map[string]int{}}
+	l := newList()
 	b, err := os.ReadFile(s.listPath(uid))
 	switch {
 	case errors.Is(err, os.ErrNotExist):
@@ -348,12 +379,7 @@ func (s *Store) listLocked(uid string) (*List, error) {
 		if err := json.Unmarshal(b, l); err != nil {
 			return nil, fmt.Errorf("list %s: %w", uid, err)
 		}
-		if l.Entries == nil {
-			l.Entries = map[int]Entry{}
-		}
-		if l.Log == nil {
-			l.Log = map[string]int{}
-		}
+		fill(l)
 	}
 	s.lists[uid] = l
 	s.listMod[uid] = mod
@@ -380,13 +406,20 @@ func (s *Store) Snapshot(uid string) (List, error) {
 	if err != nil {
 		return List{}, err
 	}
-	out := List{Entries: make(map[int]Entry, len(l.Entries)), Log: make(map[string]int, len(l.Log))}
+	out := *newList()
 	for k, v := range l.Entries {
 		out.Entries[k] = v
 	}
 	for k, v := range l.Log {
 		out.Log[k] = v
 	}
+	for k, v := range l.Hidden {
+		out.Hidden[k] = v
+	}
+	for k, v := range l.Taste {
+		out.Taste[k] = v
+	}
+	out.Presets = append([]Preset(nil), l.Presets...)
 	return out, nil
 }
 
@@ -404,10 +437,11 @@ func (s *Store) Entry(uid string, id int) (Entry, bool, error) {
 
 // Change describes a partial update; nil fields are left alone.
 type Change struct {
-	Status  *string `json:"status"`
-	Episode *int    `json:"episode"`
-	Rating  *int    `json:"rating"`
-	Note    *string `json:"note"`
+	Status   *string `json:"status"`
+	Episode  *int    `json:"episode"`
+	Rating   *int    `json:"rating"`
+	Note     *string `json:"note"`
+	Priority *bool   `json:"priority"`
 }
 
 // Update applies c to an entry, creating it (as "plan") if needed. total is
@@ -460,6 +494,9 @@ func (s *Store) Update(uid string, id int, c Change, total int, day string) (Ent
 	}
 	if c.Note != nil {
 		e.Note = strings.TrimSpace(*c.Note)
+	}
+	if c.Priority != nil {
+		e.Priority = *c.Priority
 	}
 	if e.Status == Watching && e.Started == 0 {
 		e.Started = now
@@ -518,6 +555,96 @@ func (s *Store) Remove(uid string, id int) error {
 		return err
 	}
 	return nil
+}
+
+// SetHidden marks a title "not interested" (or clears it).
+func (s *Store) SetHidden(uid string, id int, hidden bool) error {
+	return s.mutate(uid, func(l *List) error {
+		if hidden {
+			l.Hidden[id] = s.now().UnixMilli()
+		} else {
+			delete(l.Hidden, id)
+		}
+		return nil
+	})
+}
+
+// SetTaste replaces the member's own taste settings.
+func (s *Store) SetTaste(uid string, taste map[string]int) error {
+	clean := map[string]int{}
+	for k, v := range taste {
+		if len(k) < 3 || len(k) > 64 || k[1] != ':' || !strings.ContainsRune("gtx", rune(k[0])) {
+			return fmt.Errorf("bad taste key %q", k)
+		}
+		if v < 1 || v > 3 {
+			continue // 0 clears
+		}
+		clean[k] = v
+	}
+	if len(clean) > 200 {
+		return errors.New("too many taste settings")
+	}
+	return s.mutate(uid, func(l *List) error { l.Taste = clean; return nil })
+}
+
+// SetPresets replaces the saved browse filters.
+func (s *Store) SetPresets(uid string, p []Preset) error {
+	if len(p) > 30 {
+		return errors.New("at most 30 saved filters")
+	}
+	for i := range p {
+		p[i].Name = strings.TrimSpace(p[i].Name)
+		if p[i].Name == "" || utf8.RuneCountInString(p[i].Name) > 40 || len(p[i].Query) > 1000 {
+			return errors.New("preset name must be 1–40 characters")
+		}
+	}
+	return s.mutate(uid, func(l *List) error { l.Presets = p; return nil })
+}
+
+func (s *Store) mutate(uid string, fn func(*List) error) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	l, err := s.listLocked(uid)
+	if err != nil {
+		return err
+	}
+	b, _ := json.Marshal(l) // cheap deep copy for rollback
+	if err := fn(l); err != nil {
+		return err
+	}
+	if err := s.saveList(uid, l); err != nil {
+		restored := newList()
+		_ = json.Unmarshal(b, restored)
+		fill(restored)
+		s.lists[uid] = restored
+		return err
+	}
+	return nil
+}
+
+// ApplyLegacy copies what the old Arsip kept beside the entries: priority
+// marks (only onto entries that exist) and taste settings (only when the
+// member has none yet). It returns how many priorities were set.
+func (s *Store) ApplyLegacy(uid string, priority []int, taste map[string]int) (int, error) {
+	n := 0
+	err := s.mutate(uid, func(l *List) error {
+		for _, id := range priority {
+			if e, ok := l.Entries[id]; ok && !e.Priority {
+				e.Priority = true
+				l.Entries[id] = e
+				n++
+			}
+		}
+		if len(l.Taste) == 0 {
+			for k, v := range taste {
+				if v >= 1 && v <= 3 && len(k) > 2 && k[1] == ':' {
+					l.Taste[k] = v
+				}
+			}
+		}
+		return nil
+	})
+	return n, err
 }
 
 // Import adds entries that are not on the list yet and returns how many were added.

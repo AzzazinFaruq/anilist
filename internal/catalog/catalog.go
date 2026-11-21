@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -48,17 +49,56 @@ type Anime struct {
 	Image      string   `json:"image"`
 	Genres     []string `json:"genres,omitempty"`
 	Studios    []string `json:"studios,omitempty"`
+	Color      string   `json:"color,omitempty"`   // dominant cover colour from AniList
+	Tier       string   `json:"tier,omitempty"`    // "layak tonton" tier S–D
+	Worth      float64  `json:"worth,omitempty"`   // "layak tonton" score 0–100
+	Sequel     bool     `json:"sequel,omitempty"`  // not the first entry of its franchise
+	Country    string   `json:"country,omitempty"` // JP, CN, KR …
 
-	synonyms []string
-	search   string // normalised title + synonyms, for substring search
+	synonyms  []string
+	search    string // normalised title + synonyms, for substring search
+	genreIdx  []int
+	tagIdx    []int
+	source    string
+	favorites int
+	franchise int
+	hypeGap   *float64
+	date      int // yyyymmdd, unknown parts as 0
 }
 
 // Detail adds the per-year detail file and the Indonesian synopsis.
 type Detail struct {
 	Anime
-	Synopsis     string `json:"synopsis,omitempty"`
-	SynopsisLang string `json:"synopsisLang,omitempty"`
-	Links        []Link `json:"links,omitempty"`
+	Synopsis     string   `json:"synopsis,omitempty"`
+	SynopsisLang string   `json:"synopsisLang,omitempty"`
+	Links        []Link   `json:"links,omitempty"`
+	Tags         []string `json:"tags,omitempty"`
+	Source       string   `json:"source,omitempty"`
+	Favorites    int      `json:"favorites,omitempty"`
+	Trailer      string   `json:"trailer,omitempty"` // https URL
+}
+
+// Meta lists the vocabularies the browse filters use.
+type Meta struct {
+	Genres  []string   `json:"genres"`
+	Tags    []TagInfo  `json:"tags"`
+	Studios []string   `json:"studios"`
+	Tiers   []TierInfo `json:"tiers"`
+	Years   [2]int     `json:"years"`
+}
+
+// TagInfo is a theme tag with its AniList category and how many titles carry it.
+type TagInfo struct {
+	Name     string `json:"name"`
+	Category string `json:"category"`
+	Count    int    `json:"count"`
+}
+
+// TierInfo describes one "layak tonton" tier.
+type TierInfo struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	Min  int    `json:"min"`
 }
 
 // Link is a legal streaming page for a title.
@@ -78,6 +118,8 @@ type snapshot struct {
 	items   []*Anime
 	byID    map[int]*Anime
 	airing  map[int][]Airing // per title, sorted by time
+	meta    *Meta
+	idf     []float64 // per tag index, for "similar titles"
 	modTime time.Time
 }
 
@@ -89,6 +131,7 @@ type Catalog struct {
 	mu       sync.Mutex
 	details  map[int]map[string]rawDetail // year → id → detail, loaded lazily
 	synopsID map[string]string
+	graph    map[string][][2]int // AniList "recommended" links, loaded lazily
 }
 
 // Open loads the catalogue from dir. synopsisPath (optional) points to the
@@ -122,11 +165,13 @@ func (c *Catalog) Reload() error {
 		// Index unchanged; airing.json is refreshed daily on its own.
 		air := c.loadAiring()
 		if air != nil {
-			c.snap.Store(&snapshot{items: old.items, byID: old.byID, airing: air, modTime: old.modTime})
+			next := *old
+			next.airing = air
+			c.snap.Store(&next)
 		}
 		return nil
 	}
-	items, err := loadIndex(path)
+	items, meta, idf, err := loadIndex(path)
 	if err != nil {
 		return err
 	}
@@ -138,10 +183,11 @@ func (c *Catalog) Reload() error {
 	if air == nil {
 		air = map[int][]Airing{}
 	}
-	c.snap.Store(&snapshot{items: items, byID: byID, airing: air, modTime: fi.ModTime()})
+	c.snap.Store(&snapshot{items: items, byID: byID, airing: air, meta: meta, idf: idf, modTime: fi.ModTime()})
 
 	c.mu.Lock()
 	c.details = map[int]map[string]rawDetail{} // detail files are regenerated together with the index
+	c.graph = nil
 	c.mu.Unlock()
 	return nil
 }
@@ -161,6 +207,9 @@ func (c *Catalog) Watch(interval time.Duration, stop <-chan struct{}, logf func(
 		}
 	}
 }
+
+// Meta returns the filter vocabularies.
+func (c *Catalog) Meta() *Meta { return c.snap.Load().meta }
 
 // Len is the number of titles.
 func (c *Catalog) Len() int { return len(c.snap.Load().items) }
@@ -248,9 +297,22 @@ func (c *Catalog) Detail(id int) (*Detail, bool) {
 	if !ok {
 		return nil, false
 	}
-	d := &Detail{Anime: *a}
+	snap := c.snap.Load()
+	d := &Detail{Anime: *a, Source: sourceName(a.source), Favorites: a.favorites}
+	for _, t := range a.tagIdx {
+		if t >= 0 && t < len(snap.meta.Tags) {
+			d.Tags = append(d.Tags, snap.meta.Tags[t].Name)
+		}
+	}
 	if raw, ok := c.rawDetail(a.Year, id); ok {
 		d.Synopsis, d.SynopsisLang = raw.Desc, "en"
+		if len(raw.Trailer) == 2 {
+			id, _ := raw.Trailer[0].(string)
+			site, _ := raw.Trailer[1].(string)
+			if site == "youtube" && validTrailerID(id) {
+				d.Trailer = "https://www.youtube.com/watch?v=" + id
+			}
+		}
 		for _, l := range raw.Links {
 			if len(l) >= 2 {
 				site, _ := l[0].(string)
@@ -270,9 +332,16 @@ func (c *Catalog) Detail(id int) (*Detail, bool) {
 // ---------- loading ----------
 
 type rawIndex struct {
-	Genres  []string   `json:"genres"`
-	Studios []string   `json:"studios"`
-	Items   []rawAnime `json:"items"`
+	Genres  []string             `json:"genres"`
+	Tags    []string             `json:"tags"`
+	TagMeta map[string][2]string `json:"tagMeta"`
+	Studios []string             `json:"studios"`
+	First   int                  `json:"first_year"`
+	Last    int                  `json:"last_year"`
+	Layak   struct {
+		Tiers []TierInfo `json:"tiers"`
+	} `json:"layak"`
+	Items []rawAnime `json:"items"`
 }
 
 type rawAnime struct {
@@ -292,11 +361,23 @@ type rawAnime struct {
 	Genres   []int    `json:"g"`
 	Studios  []int    `json:"stu"`
 	Synonyms []string `json:"syn"`
+	Tags     []int    `json:"tg"`
+	Color    string   `json:"col"`
+	Source   string   `json:"src"`
+	Country  string   `json:"c"`
+	Fav      int      `json:"fv"`
+	Fr       int      `json:"fr"`
+	Sq       int      `json:"sq"`
+	HypeGap  *float64 `json:"hg"`
+	Worth    float64  `json:"lw"`
+	Tier     string   `json:"lt"`
+	Date     []*int   `json:"d"`
 }
 
 type rawDetail struct {
-	Desc  string  `json:"d"`
-	Links [][]any `json:"li"`
+	Desc    string  `json:"d"`
+	Links   [][]any `json:"li"`
+	Trailer []any   `json:"tr"`
 }
 
 func openMaybeGz(path string) (io.ReadCloser, error) {
@@ -327,13 +408,13 @@ func readJSON(path string, v any) error {
 	return json.NewDecoder(r).Decode(v)
 }
 
-func loadIndex(path string) ([]*Anime, error) {
+func loadIndex(path string) ([]*Anime, *Meta, []float64, error) {
 	var raw rawIndex
 	if err := readJSON(path, &raw); err != nil {
-		return nil, fmt.Errorf("catalog: read %s: %w", path, err)
+		return nil, nil, nil, fmt.Errorf("catalog: read %s: %w", path, err)
 	}
 	if len(raw.Items) == 0 {
-		return nil, errors.New("catalog: index has no items")
+		return nil, nil, nil, errors.New("catalog: index has no items")
 	}
 	pick := func(names []string, idx []int) []string {
 		var out []string
@@ -344,6 +425,7 @@ func loadIndex(path string) ([]*Anime, error) {
 		}
 		return out
 	}
+	tagCount := make([]int, len(raw.Tags))
 	items := make([]*Anime, 0, len(raw.Items))
 	for _, r := range raw.Items {
 		if r.ID == 0 || r.Title == "" {
@@ -353,7 +435,14 @@ func loadIndex(path string) ([]*Anime, error) {
 			ID: r.ID, Title: r.Title, English: r.English, Native: r.Native, Year: r.Year, Season: r.Season,
 			Format: r.Format, Status: r.Status, Episodes: r.Episodes, Duration: r.Duration, Score: r.Score,
 			Popularity: r.Pop, Image: r.Image, Genres: pick(raw.Genres, r.Genres), Studios: pick(raw.Studios, r.Studios),
-			synonyms: r.Synonyms,
+			Color: safeColor(r.Color), Tier: r.Tier, Worth: r.Worth, Sequel: r.Sq != 0, Country: r.Country,
+			synonyms: r.Synonyms, genreIdx: r.Genres, tagIdx: r.Tags, source: r.Source, favorites: r.Fav,
+			franchise: r.Fr, hypeGap: r.HypeGap, date: dateKey(r.Year, r.Season, r.Date),
+		}
+		for _, t := range r.Tags {
+			if t >= 0 && t < len(tagCount) {
+				tagCount[t]++
+			}
 		}
 		parts := append([]string{r.Title, r.English, r.Native}, r.Synonyms...)
 		var keys []string
@@ -368,7 +457,71 @@ func loadIndex(path string) ([]*Anime, error) {
 		a.search = strings.Join(keys, "|")
 		items = append(items, a)
 	}
-	return items, nil
+	meta := &Meta{Genres: raw.Genres, Studios: raw.Studios, Tiers: raw.Layak.Tiers, Years: [2]int{raw.First, raw.Last}}
+	idf := make([]float64, len(raw.Tags))
+	for i, name := range raw.Tags {
+		cat := raw.TagMeta[name][0]
+		meta.Tags = append(meta.Tags, TagInfo{Name: name, Category: cat, Count: tagCount[i]})
+		if tagCount[i] > 0 {
+			idf[i] = math.Log(float64(len(items)) / float64(tagCount[i]))
+		}
+	}
+	if meta.Years[0] == 0 {
+		meta.Years = [2]int{2000, time.Now().Year() + 1}
+	}
+	return items, meta, idf, nil
+}
+
+func dateKey(year int, season *int, d []*int) int {
+	m, day := 0, 0
+	if len(d) >= 2 && d[1] != nil {
+		m = *d[1]
+	} else if season != nil {
+		m = *season*3 + 1
+	}
+	if len(d) >= 3 && d[2] != nil {
+		day = *d[2]
+	}
+	return year*10000 + m*100 + day
+}
+
+// safeColor accepts only "#rrggbb", since it ends up in a style attribute.
+func safeColor(s string) string {
+	if len(s) != 7 || s[0] != '#' {
+		return ""
+	}
+	for _, r := range s[1:] {
+		if !strings.ContainsRune("0123456789abcdefABCDEF", r) {
+			return ""
+		}
+	}
+	return strings.ToLower(s)
+}
+
+func validTrailerID(id string) bool {
+	if len(id) < 6 || len(id) > 20 {
+		return false
+	}
+	for _, r := range id {
+		if !(r == '-' || r == '_' || unicode.IsLetter(r) && r < 128 || unicode.IsDigit(r)) {
+			return false
+		}
+	}
+	return true
+}
+
+var sources = map[string]string{
+	"MANGA": "Manga", "LIGHT_NOVEL": "Light novel", "WEB_NOVEL": "Web novel", "NOVEL": "Novel",
+	"ORIGINAL": "Cerita orisinal", "VISUAL_NOVEL": "Visual novel", "VIDEO_GAME": "Game", "GAME": "Game",
+	"DOUJINSHI": "Doujinshi", "COMIC": "Komik", "LIVE_ACTION": "Live action", "MULTIMEDIA_PROJECT": "Proyek multimedia",
+	"PICTURE_BOOK": "Buku bergambar", "ANIME": "Anime", "OTHER": "",
+}
+
+func sourceName(s string) string {
+	if n, ok := sources[s]; ok {
+		return n
+	}
+	return s
 }
 
 func (c *Catalog) loadAiring() map[int][]Airing {

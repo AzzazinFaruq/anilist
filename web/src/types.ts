@@ -16,12 +16,21 @@ export interface Anime {
   image: string;
   genres?: string[];
   studios?: string[];
+  color?: string;
+  tier?: string;
+  worth?: number;
+  sequel?: boolean;
+  country?: string;
 }
 
 export interface Detail extends Anime {
   synopsis?: string;
   synopsisLang?: "id" | "en";
   links?: { site: string; url: string }[];
+  tags?: string[];
+  source?: string;
+  favorites?: number;
+  trailer?: string;
 }
 
 export interface Entry {
@@ -29,6 +38,7 @@ export interface Entry {
   episode?: number;
   rating?: number;
   note?: string;
+  priority?: boolean;
   updated: number;
 }
 
@@ -42,6 +52,10 @@ export interface Item {
   anime: Anime;
   entry?: Entry;
   next?: Airing;
+  released?: number;
+  why?: string[];
+  match?: number;
+  kind?: string;
 }
 
 export interface Me {
@@ -51,3 +65,24 @@ export interface Me {
 }
 
 export type Counts = Partial<Record<Status, number>>;
+
+export interface DayCount {
+  day: string;
+  n: number;
+}
+
+export interface TagInfo {
+  name: string;
+  category: string;
+  count: number;
+}
+
+export interface Meta {
+  genres: string[];
+  tags: TagInfo[];
+  studios: string[];
+  tiers: { id: string; name: string; min: number }[];
+  years: [number, number];
+  sorts: [string, string][];
+  current: { year: number; season: number };
+}

@@ -8,14 +8,21 @@ import { Account } from "./pages/Account";
 import { Home } from "./pages/Home";
 import { List } from "./pages/List";
 import { Login } from "./pages/Login";
-import { Search } from "./pages/Search";
+import { Browse } from "./pages/Browse";
+import { Temuan } from "./pages/Temuan";
 
 const PAGES: [Page, string][] = [
   ["nonton", "Nonton"],
+  ["jelajah", "Jelajah"],
+  ["temuan", "Temuan"],
   ["daftar", "Daftar"],
-  ["cari", "Cari"],
 ];
-const TITLES: Record<Page, string> = { nonton: "Nonton", daftar: "Daftar", cari: "Cari", akun: "Akun" };
+const TITLES: Record<Page, string> = { nonton: "Nonton", jelajah: "Jelajah", temuan: "Temuan", daftar: "Daftar", akun: "Akun" };
+
+function focusSearch() {
+  if (!location.pathname.startsWith("/jelajah")) navigate("/jelajah");
+  requestAnimationFrame(() => document.getElementById("global-search")?.focus());
+}
 
 export function App() {
   const [me, setMe] = useState<Me | null | undefined>(undefined);
@@ -30,6 +37,20 @@ export function App() {
   useEffect(() => {
     document.title = me ? `${TITLES[page]} · Tonton` : "Tonton";
   }, [page, me]);
+
+  // "/" or Ctrl K: search from anywhere.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const t = e.target as HTMLElement;
+      const typing = ["INPUT", "TEXTAREA", "SELECT"].includes(t.tagName);
+      if ((e.key === "k" && (e.ctrlKey || e.metaKey)) || (e.key === "/" && !typing && !document.querySelector("dialog[open]"))) {
+        e.preventDefault();
+        focusSearch();
+      }
+    };
+    addEventListener("keydown", onKey);
+    return () => removeEventListener("keydown", onKey);
+  }, []);
 
   if (bootError && me === undefined)
     return (
@@ -72,6 +93,12 @@ export function App() {
             </a>
           ))}
         </nav>
+        <button type="button" className="search-btn" onClick={focusSearch} aria-label="Cari judul (/ atau Ctrl K)" title="Cari judul (/ atau Ctrl K)">
+          <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
+            <circle cx="10.5" cy="10.5" r="6.5" fill="none" stroke="currentColor" strokeWidth="2" />
+            <path d="M15.5 15.5 20 20" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+          </svg>
+        </button>
         <a className="who" href="/akun" onClick={go("akun")} aria-current={page === "akun" ? "page" : undefined}>
           {me.name}
         </a>
@@ -79,7 +106,8 @@ export function App() {
       <main id="main" className="page">
         {page === "nonton" && <Home />}
         {page === "daftar" && <List />}
-        {page === "cari" && <Search />}
+        {page === "jelajah" && <Browse />}
+        {page === "temuan" && <Temuan />}
         {page === "akun" && (
           <Account
             me={me}

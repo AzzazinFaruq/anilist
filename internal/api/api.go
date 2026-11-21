@@ -30,8 +30,10 @@ type Server struct {
 	Sessions auth.Sessions
 	Limiter  *auth.Limiter
 	Loc      *time.Location
-	Static   fs.FS // built web app; nil serves the API only
-	AnyIP    bool  // accept clients outside LAN/Tailscale (tests, reverse proxies)
+	Static   fs.FS  // built web app; nil serves the API only
+	DataDir  string // for per-member recommendation files (temuan/<id>.json)
+	Token    string // bearer token for /internal/summary (dashboard); empty disables it
+	AnyIP    bool   // accept clients outside LAN/Tailscale (tests, reverse proxies)
 	Now      func() time.Time
 }
 
@@ -60,6 +62,19 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /api/search", s.user(s.search))
 	mux.Handle("GET /api/season", s.user(s.season))
 	mux.Handle("GET /api/anime/{id}", s.user(s.detail))
+	mux.Handle("GET /api/anime/{id}/similar", s.user(s.similar))
+	mux.Handle("GET /api/meta", s.user(s.meta))
+	mux.Handle("GET /api/browse", s.user(s.browse))
+	mux.Handle("GET /api/schedule", s.user(s.schedule))
+	mux.Handle("GET /api/pick", s.user(s.pick))
+	mux.Handle("GET /api/temuan", s.user(s.temuan))
+	mux.Handle("PUT /api/hidden/{id}", s.user(s.setHidden))
+	mux.Handle("PUT /api/taste", s.user(s.setTaste))
+	mux.Handle("GET /api/presets", s.user(s.presets))
+	mux.Handle("PUT /api/presets", s.user(s.setPresets))
+	mux.Handle("GET /api/stats", s.user(s.stats))
+	mux.Handle("GET /api/export", s.user(s.export))
+	mux.HandleFunc("GET /internal/summary", s.summary)
 
 	// Admin: family members.
 	mux.Handle("GET /api/users", s.admin(s.users))
@@ -355,9 +370,13 @@ func (s *Server) changePIN(w http.ResponseWriter, r *http.Request, u store.User)
 
 // Item pairs a title with the member's entry and next airing time.
 type Item struct {
-	Anime *catalog.Anime  `json:"anime"`
-	Entry *store.Entry    `json:"entry,omitempty"`
-	Next  *catalog.Airing `json:"next,omitempty"`
+	Anime    *catalog.Anime  `json:"anime"`
+	Entry    *store.Entry    `json:"entry,omitempty"`
+	Next     *catalog.Airing `json:"next,omitempty"`
+	Released *int            `json:"released,omitempty"` // episodes aired so far, when known
+	Why      []string        `json:"why,omitempty"`      // recommendation reasons
+	Match    float64         `json:"match,omitempty"`    // recommendation score 0–1
+	Kind     string          `json:"kind,omitempty"`     // recommendation kind: baru, tayang, segera, lama
 }
 
 func (s *Server) item(a *catalog.Anime, e *store.Entry) Item {
@@ -402,38 +421,6 @@ func byUpdated(items []Item) {
 			return a.Anime.Popularity > b.Anime.Popularity
 		}
 		return a.Anime.ID < b.Anime.ID
-	})
-}
-
-func (s *Server) home(w http.ResponseWriter, r *http.Request, u store.User) {
-	items, counts, l, ok := s.entries(w, u.ID)
-	if !ok {
-		return
-	}
-	byUpdated(items)
-	watching, plan, upcoming := []Item{}, []Item{}, []Item{}
-	weekEnd := s.now().Add(7 * 24 * time.Hour).Unix()
-	for _, it := range items {
-		switch it.Entry.Status {
-		case store.Watching:
-			watching = append(watching, it)
-		case store.Plan:
-			if len(plan) < 5 {
-				plan = append(plan, it)
-			}
-		}
-		if it.Next != nil && it.Next.At <= weekEnd && (it.Entry.Status == store.Watching || it.Entry.Status == store.Plan) {
-			upcoming = append(upcoming, it)
-		}
-	}
-	sort.Slice(upcoming, func(i, j int) bool { return upcoming[i].Next.At < upcoming[j].Next.At })
-	week := 0
-	for i := 0; i < 7; i++ {
-		week += l.Log[s.now().AddDate(0, 0, -i).Format("2006-01-02")]
-	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"watching": watching, "plan": plan, "upcoming": upcoming, "counts": counts,
-		"today": l.Log[s.today()], "week": week,
 	})
 }
 
